@@ -27,139 +27,141 @@ let percentile = 70
 // Force unwrapping with ! does not provide source location when unwrapping
 // nil, so we instead make a util function for debuggability.
 fileprivate extension Optional {
-  func unwrapped(file: StaticString = #file, line: UInt = #line) -> Wrapped {
-    guard let unwrapped = self else {
-      fatalError("Value is nil", file: file, line: line)
+    func unwrapped(file: StaticString = #file, line: UInt = #line) -> Wrapped {
+        guard let unwrapped = self else {
+            fatalError("Value is nil", file: file, line: line)
+        }
+        return unwrapped
     }
-    return unwrapped
-  }
 }
 
 /// A simple two layer dense net.
 struct Net: Layer {
-  var l1, l2: Dense<Float>
+    typealias Input = Tensor<Float>
+    typealias Output = Tensor<Float>
 
-  init(observationSize: Int, hiddenSize: Int, actionCount: Int) {
-    self.l1 = Dense<Float>(
-      inputSize: observationSize, outputSize: hiddenSize, activation: relu)
+    var l1, l2: Dense<Float>
 
-    self.l2 = Dense<Float>(
-      inputSize: hiddenSize, outputSize: actionCount, activation: { $0 })
-  }
+    init(observationSize: Int, hiddenSize: Int, actionCount: Int) {
+        self.l1 = Dense<Float>(
+          inputSize: observationSize, outputSize: hiddenSize, activation: relu)
 
-  @differentiable(wrt: (self, input))
-  func applied(to input: Tensor<Float>, in context: Context) -> Tensor<Float> {
-    return l2.applied(to: l1.applied(to: input, in: context), in: context)
-  }
+        self.l2 = Dense<Float>(
+          inputSize: hiddenSize, outputSize: actionCount, activation: { $0 })
+    }
+
+    @differentiable
+    func call(_ input: Input) -> Output {
+        return input.sequenced(through: l1, l2)
+    }
 }
 
 /// An episode is a list of steps, where each step records the observation from
 /// env and the action taken. They will serve respectively as the input and
 /// target (label) of the neural net training.
 struct Episode {
-  struct Step {
-    let observation: Tensor<Float>
-    let action: Int32
-  }
+    struct Step {
+        let observation: Tensor<Float>
+        let action: Int32
+    }
 
-  let steps: [Step]
-  let reward: Float
+    let steps: [Step]
+    let reward: Float
 }
 
 /// Filter out bad/short episodes before we feed them as neural net training
 /// data.
 func filteringBatch(
-    episodes: [Episode],
-    actionCount: Int
+  episodes: [Episode],
+  actionCount: Int
 ) -> (input: Tensor<Float>,
       target: Tensor<Float>,
       episodeCount: Int,
       meanReward: Float) {
-  let rewards = episodes.map { $0.reward }
-  let rewardBound = Float(np.percentile(rewards, percentile))!
-  print("rewardBound = \(rewardBound)")
+    let rewards = episodes.map { $0.reward }
+    let rewardBound = Float(np.percentile(rewards, percentile))!
+    print("rewardBound = \(rewardBound)")
 
-  var input = Tensor<Float>(0.0)
-  var target = Tensor<Float>(0.0)
-  var totalReward: Float = 0.0
+    var input = Tensor<Float>(0.0)
+    var target = Tensor<Float>(0.0)
+    var totalReward: Float = 0.0
 
-  var retainedEpisodeCount = 0
-  for episode in episodes {
-    if episode.reward < rewardBound {
-      continue
+    var retainedEpisodeCount = 0
+    for episode in episodes {
+        if episode.reward < rewardBound {
+            continue
+        }
+
+        let observationTensor = Tensor<Float>(episode.steps.map { $0.observation })
+        let actionTensor = Tensor<Int32>(episode.steps.map { $0.action })
+        let oneHotLabels = Tensor<Float>(oneHotAtIndices: actionTensor, depth: actionCount)
+
+        // print("observations tensor has shape \(observationTensor.shapeTensor)")
+        // print("actions tensor has shape \(actionTensor.shapeTensor)")
+        // print("onehot actions tensor has shape \(oneHotLabels.shapeTensor)")
+
+        if retainedEpisodeCount == 0 {
+            input = observationTensor
+            target = oneHotLabels
+        } else {
+            input = input.concatenated(with: observationTensor)
+            target = target.concatenated(with: oneHotLabels)
+        }
+        // print("input tensor has shape \(input.shapeTensor)")
+        // print("target tensor has shape \(target.shapeTensor)")
+
+        totalReward += episode.reward
+        retainedEpisodeCount += 1
     }
 
-    let observationTensor = Tensor<Float>(episode.steps.map { $0.observation })
-    let actionTensor = Tensor<Int32>(episode.steps.map { $0.action })
-    let oneHotLabels = Tensor<Float>(oneHotAtIndices: actionTensor, depth: Int32(actionCount))
-
-    // print("observations tensor has shape \(observationTensor.shapeTensor)")
-    // print("actions tensor has shape \(actionTensor.shapeTensor)")
-    // print("onehot actions tensor has shape \(oneHotLabels.shapeTensor)")
-
-    if retainedEpisodeCount == 0 {
-      input = observationTensor
-      target = oneHotLabels
-    } else {
-      input = input.concatenated(with: observationTensor)
-      target = target.concatenated(with: oneHotLabels)
-    }
-    // print("input tensor has shape \(input.shapeTensor)")
-    // print("target tensor has shape \(target.shapeTensor)")
-
-    totalReward += episode.reward
-    retainedEpisodeCount += 1
-  }
-  
-  return (input, target, retainedEpisodeCount, totalReward / Float(retainedEpisodeCount))
+    return (input, target, retainedEpisodeCount, totalReward / Float(retainedEpisodeCount))
 }
 
 func nextBatch(
-    env: PythonObject,
-    net: Net,
-    batchSize: Int,
-    actionCount: Int
+  env: PythonObject,
+  net: Net,
+  batchSize: Int,
+  actionCount: Int
 ) -> [Episode] {
-  var observationNumpy = env.reset()
+    var observationNumpy = env.reset()
 
-  let context = Context(learningPhase: .inference)
-  var episodes: [Episode] = []
-  
-  // We build up a batch of observations and actions.
-  for _ in 0..<batchSize {
-    var steps: [Episode.Step] = []
-    var episodeReward: Float = 0.0
+    var episodes: [Episode] = []
 
-    while true {
-      let observationPython = Tensor<Double>(numpy: observationNumpy).unwrapped()
-      let actionProbabilities =
-          softmax(net.applied(to: Tensor(observationPython).reshaped(to: [1, 4]), in: context))
-      let actionProbabilitiesPython = actionProbabilities[0].makeNumpyArray()
-      let len = Python.len(actionProbabilitiesPython)
-      assert(actionCount == Int(Python.len(actionProbabilitiesPython)))
-      
-      let actionPython = np.random.choice(len, p: actionProbabilitiesPython)
-      let (nextObservation, reward, isDone, _) = env.step(actionPython).tuple4
-      // print(nextObservation)
-      // print(reward)
+    // We build up a batch of observations and actions.
+    for _ in 0..<batchSize {
+        var steps: [Episode.Step] = []
+        var episodeReward: Float = 0.0
 
-      steps.append(Episode.Step(observation: Tensor<Float>(observationPython),
-                                action: Int32(actionPython).unwrapped()))
+        while true {
+            let observationPython = Tensor<Double>(numpy: observationNumpy).unwrapped()
+            let actionProbabilities =
+              softmax(net(Tensor(observationPython).reshaped(to: [1, 4])))
+            let actionProbabilitiesPython = actionProbabilities[0].makeNumpyArray()
+            let len = Python.len(actionProbabilitiesPython)
+            assert(actionCount == Int(Python.len(actionProbabilitiesPython)))
 
-      episodeReward += Float(reward).unwrapped()
+            let actionPython = np.random.choice(len, p: actionProbabilitiesPython)
+            let (nextObservation, reward, isDone, _) = env.step(actionPython).tuple4
+            // print(nextObservation)
+            // print(reward)
 
-      if isDone == true {
-        // print("Finishing an episode with \(observations.count) steps and total reward \(episodeReward)")
-        episodes.append(Episode(steps: steps, reward: episodeReward))
-        observationNumpy = env.reset()
-        break
-      } else {
-        observationNumpy = nextObservation
-      }
+            steps.append(Episode.Step(observation: Tensor<Float>(observationPython),
+                                      action: Int32(actionPython).unwrapped()))
+
+            episodeReward += Float(reward).unwrapped()
+
+            if isDone == true {
+                // print("Finishing an episode with \(observations.count) steps and total reward \(episodeReward)")
+                episodes.append(Episode(steps: steps, reward: episodeReward))
+                observationNumpy = env.reset()
+                break
+            } else {
+                observationNumpy = nextObservation
+            }
+        }
     }
-  }
 
-  return episodes
+    return episodes
 }
 
 let env = gym.make("CartPole-v0")
@@ -170,29 +172,29 @@ let actionCount = Int(env.action_space.n).unwrapped()
 var net = Net(observationSize: Int(observationSize), hiddenSize: hiddenSize, actionCount: actionCount)
 // SGD optimizer reaches convergence with ~125 mini batches, while Adam uses ~25.
 // let optimizer = SGD<Net, Float>(learningRate: 0.1, momentum: 0.9)
-let optimizer = Adam<Net, Float>(learningRate: 0.01)
+let optimizer = Adam(for: net, learningRate: 0.01)
 var batchIndex = 0
+Context.local.learningPhase = .training
 while true {
-  print("Processing mini batch \(batchIndex)")
-  batchIndex += 1
-  
-  let episodes = nextBatch(env: env, net: net, batchSize: batchSize, actionCount: actionCount)
-  let (input, target, episodeCount, meanReward) = filteringBatch(
-    episodes: episodes, actionCount: actionCount)
+    print("Processing mini batch \(batchIndex)")
+    batchIndex += 1
 
-  let gradients = gradient(at: net) { model -> Tensor<Float> in
-    let context = Context(learningPhase: .training)
-    let logits = model.applied(to: input, in: context)
-    let loss = softmaxCrossEntropy(logits: logits, labels: target)
-    print("loss is \(loss)")
-    return loss
-  }
-  optimizer.update(&net.allDifferentiableVariables, along: gradients)
+    let episodes = nextBatch(env: env, net: net, batchSize: batchSize, actionCount: actionCount)
+    let (input, target, episodeCount, meanReward) = filteringBatch(
+      episodes: episodes, actionCount: actionCount)
 
-  print("It has episode count \(episodeCount) and mean reward \(meanReward)")
+    let gradients = gradient(at: net) { model -> Tensor<Float> in
+        let logits = model(input)
+        let loss = softmaxCrossEntropy(logits: logits, probabilities: target)
+        print("loss is \(loss)")
+        return loss
+    }
+    optimizer.update(&net.allDifferentiableVariables, along: gradients)
 
-  if meanReward > 199 {
-    print("Solved")
-    break
-  }
+    print("It has episode count \(episodeCount) and mean reward \(meanReward)")
+
+    if meanReward > 199 {
+        print("Solved")
+        break
+    }
 }

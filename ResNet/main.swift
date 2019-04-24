@@ -7,19 +7,18 @@ let batchSize = 100
 let cifarDataset = loadCIFAR10()
 let testBatches = cifarDataset.test.batched(batchSize)
 
-// ResNet20, ResNet32, ResNet44, ResNet56, WideResNet16, WideResNet28
-//var model = PyTorchModel()
-var model = KerasModel()
+// ResNet18, ResNet34, ResNet50, ResNet101, ResNet152
+// PreActivatedResNet18, PreActivatedResNet34
+var model = ResNet50(imageSize: 32, classCount: 10) // Use the network sized for CIFAR-10
 
-// optimizer used in the PyTorch code
-// let optimizer = SGD(for: model, learningRate: 0.001, momentum: 0.9)
-// optimizer used in the Keras code
-let optimizer = RMSProp(for: model, learningRate: 0.0001, decay: 1e-6)
+// the classic ImageNet optimizer setting diverges on CIFAR-10
+// let optimizer = SGD(for: model, learningRate: 0.1, momentum: 0.9)
+let optimizer = SGD(for: model, learningRate: 0.001)
 
 print("Starting training...")
 Context.local.learningPhase = .training
 
-for epoch in 1...100 {
+for epoch in 1...10 {
     var trainingLossSum: Float = 0
     var trainingBatchCount = 0
     let trainingShuffled = cifarDataset.training.shuffled(
@@ -34,7 +33,6 @@ for epoch in 1...100 {
         trainingBatchCount += 1
         optimizer.update(&model.allDifferentiableVariables, along: gradients)
     }
-
     var testLossSum: Float = 0
     var testBatchCount = 0
     var correctGuessCount = 0
